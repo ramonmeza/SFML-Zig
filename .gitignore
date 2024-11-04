@@ -5,3 +5,5 @@
 build/
 cmake-build-*/
 CMakeUserPresets.json
+.zig-cache/
+zig-out/
