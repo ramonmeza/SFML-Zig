@@ -1,95 +1,255 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    const targets = [_]std.Target.Query{.{
+    const target = b.standardTargetOptions(.{ .default_target = .{
         .os_tag = std.Target.Os.Tag.windows,
         .cpu_arch = std.Target.Cpu.Arch.x86_64,
-    }};
-    const target = b.standardTargetOptions(.{ .whitelist = &targets });
+        .abi = std.Target.Abi.msvc,
+    } });
     const optimize = b.standardOptimizeOption(.{});
 
-    // sfml-main
-    const sfml_main = b.addStaticLibrary(.{
-        .name = "sfml-main",
-        .target = target,
-        .optimize = optimize,
-    });
+    const SFML_BUILD_AUDIO: bool = b.option(bool, "SFML_BUILD_AUDIO", "Whether to build SFML's Audio module. Defaults to `true`.") orelse true;
+    const SFML_BUILD_GRAPHICS: bool = b.option(bool, "SFML_BUILD_GRAPHICS", "Whether to build SFML's Graphics module. Defaults to `true`.") orelse true;
+    const SFML_BUILD_NETWORK: bool = b.option(bool, "SFML_BUILD_NETWORK", "Whether to build SFML's Network module. Defaults to `true`.") orelse true;
+    const SFML_BUILD_WINDOW: bool = b.option(bool, "SFML_BUILD_WINDOW", "Whether to build SFML's Window module. Defaults to `true`.") orelse true;
 
-    sfml_main.addCSourceFile(.{ .file = b.path("src/SFML/Main/MainWin32.cpp") });
+    const sfml_system: *std.Build.Step.Compile = build_sfml_system(b, target, optimize);
+    b.installArtifact(sfml_system);
 
-    sfml_main.addIncludePath(b.path("include"));
-    sfml_main.addIncludePath(b.path("src"));
+    const sfml_main = build_sfml_main(b, target, optimize);
+    b.installArtifact(sfml_main.?);
 
-    sfml_main.linkLibCpp();
+    if (SFML_BUILD_AUDIO) {
+        const vorbis: *std.Build.Step.Compile = build_vorbis(b, target, optimize);
+        b.installArtifact(vorbis);
 
-    b.installArtifact(sfml_main);
+        const flac: *std.Build.Step.Compile = build_flac(b, target, optimize);
+        b.installArtifact(flac);
 
-    // sfml-system
-    const sfml_system = b.addStaticLibrary(.{
+        const sfml_audio = build_sfml_audio(b, target, optimize, vorbis, flac, sfml_system);
+        b.installArtifact(sfml_audio);
+    }
+
+    if (SFML_BUILD_GRAPHICS) {
+        var sfml_graphics: *std.Build.Step.Compile = build_sfml_graphics(b, target, optimize);
+        b.installArtifact(sfml_graphics);
+    }
+
+    if (SFML_BUILD_NETWORK) {
+        var sfml_network: *std.Build.Step.Compile = undefined;
+        b.installArtifact(sfml_network);
+    }
+
+    if (SFML_BUILD_WINDOW) {
+        var sfml_window: *std.Build.Step.Compile = undefined;
+        b.installArtifact(sfml_window);
+    }
+}
+
+fn build_sfml_system(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
+    const lib = b.addStaticLibrary(.{
         .name = "sfml-system",
         .target = target,
         .optimize = optimize,
     });
 
-    const sfml_system_source_files = [_][]const u8{
+    lib.addIncludePath(b.path("src"));
+    lib.addIncludePath(b.path("include"));
+
+    const source_files = [_][]const u8{
         "Clock.cpp",
         "Err.cpp",
         "Sleep.cpp",
         "String.cpp",
         "Utils.cpp",
+        "Vector2.cpp",
         "Vector3.cpp",
         "FileInputStream.cpp",
         "MemoryInputStream.cpp",
     };
-    sfml_system.addCSourceFiles(.{ .root = b.path("src/SFML/System"), .files = &sfml_system_source_files });
+    lib.addCSourceFiles(.{
+        .root = b.path("src/SFML/System"),
+        .files = &source_files,
+        .flags = &[_][]const u8{"-std=c++17"},
+    });
 
-    sfml_system.addIncludePath(b.path("include"));
-    sfml_system.addIncludePath(b.path("src"));
+    if (target.result.os.tag == std.Target.Os.Tag.windows) {
+        lib.addCSourceFile(.{
+            .file = b.path("src/SFML/System/Win32/SleepImpl.cpp"),
+            .flags = &[_][]const u8{"-std=c++17"},
+        });
+        lib.addIncludePath(b.path("src/SFML/System/Win32"));
+    } else {
+        lib.addCSourceFile(.{
+            .file = b.path("src/SFML/System/Unix/SleepImpl.cpp"),
+            .flags = &[_][]const u8{"-std=c++17"},
+        });
+        lib.addIncludePath(b.path("src/SFML/System/Unix"));
 
-    sfml_system.linkLibCpp();
+        if (target.result.isAndroid()) {
+            lib.addIncludePath(b.path("src/SFML/System/Android"));
 
-    b.installArtifact(sfml_system);
+            const android_source_files = [_][]const u8{
+                "Activity.cpp",
+                "NativeActivity.cpp",
+                "ResourceStream.cpp",
+                "ResourceStream.cpp",
+                "SuspendAwareClock.cpp",
+            };
+            lib.addCSourceFiles(.{
+                .root = b.path("src/SFML/System/Android"),
+                .files = &android_source_files,
+                .flags = &[_][]const u8{"-std=c++17"},
+            });
+        }
+    }
 
-    // sfml-audio
+    if (target.result.os.tag == std.Target.Os.Tag.windows) {
+        lib.linkSystemLibrary("kernel32");
+    } else {
+        lib.linkSystemLibrary("pthread");
+    }
 
-    // vorbis
-    const vorbis = b.addStaticLibrary(.{
+    lib.linkLibCpp();
+
+    return lib;
+}
+
+fn build_sfml_main(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) ?*std.Build.Step.Compile {
+    // define the sfml-main target
+    const lib = b.addStaticLibrary(.{
+        .name = "sfml-main",
+        .target = target,
+        .optimize = optimize,
+    });
+
+    lib.addIncludePath(b.path("src"));
+    lib.addIncludePath(b.path("include"));
+
+    // sources
+    if (target.result.os.tag == std.Target.Os.Tag.windows) {
+        lib.addCSourceFile(.{
+            .file = b.path("src/SFML/Main/MainWin32.cpp"),
+        });
+        lib.linkLibC(); // for windows.h
+    } else if (target.result.os.tag == std.Target.Os.Tag.ios) {
+        lib.addCSourceFile(.{
+            .file = b.path("src/SFML/Main/MainiOS.mm"),
+        });
+    } else if (target.result.isAndroid()) {
+        // ensure that linking into shared libraries doesn't fail
+        lib.addCSourceFile(.{
+            .file = b.path("src/SFML/Main/MainAndroid.cpp"),
+            .flags = &[_][]const u8{"-fPIC"},
+        });
+
+        // glad sources
+        lib.addIncludePath(b.path("extlibs/headers/glad/include"));
+    } else {
+        return null;
+    }
+    return lib;
+}
+
+fn build_vorbis(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
+    const lib = b.addStaticLibrary(.{
         .name = "vorbis",
         .target = target,
         .optimize = optimize,
     });
 
-    vorbis.addIncludePath(b.path("extlibs/headers/ogg"));
-    vorbis.addIncludePath(b.path("extlibs/headers/vorbis"));
+    lib.addIncludePath(b.path("extlibs/headers/ogg"));
+    lib.addIncludePath(b.path("extlibs/headers/vorbis"));
 
-    vorbis.addObjectFile(b.path("extlibs/libs-msvc-universal/x64/ogg.lib"));
-    vorbis.addObjectFile(b.path("extlibs/libs-msvc-universal/x64/vorbis.lib"));
-    vorbis.addObjectFile(b.path("extlibs/libs-msvc-universal/x64/vorbisfile.lib"));
-    vorbis.addObjectFile(b.path("extlibs/libs-msvc-universal/x64/vorbisenc.lib"));
+    if (target.result.isAndroid()) {
+        std.debug.print("@todo: include android libs based on ARCH\n", .{});
+    } else if (target.result.os.tag == std.Target.Os.Tag.ios) {
+        lib.addObjectFile(b.path("extlibs/libs-ios/libvorbis.a"));
+    } else if (target.result.os.tag == std.Target.Os.Tag.macos) {
+        std.debug.print("@todo include macos libs from .framework\n", .{});
+    } else if (target.result.isMinGW()) {
+        std.debug.print("@todo: how do i check for URT?\n", .{});
+        if (target.result.cpu.arch.isX86()) {
+            lib.addObjectFile(b.path("extlibs/libs-mingw/x86/libvorbis.a"));
+            lib.addObjectFile(b.path("extlibs/libs-mingw/x86/libvorbisenc.a"));
+            lib.addObjectFile(b.path("extlibs/libs-mingw/x86/libvorbisfile.a"));
+        } else {
+            std.debug.print("@todo: is this correctly x64?\n", .{});
+            lib.addObjectFile(b.path("extlibs/libs-mingw/x64/libvorbis.a"));
+            lib.addObjectFile(b.path("extlibs/libs-mingw/x64/libvorbisenc.a"));
+            lib.addObjectFile(b.path("extlibs/libs-mingw/x64/libvorbisfile.a"));
+        }
+    } else if (target.result.os.tag == std.Target.Os.Tag.windows) {
+        if (target.result.cpu.arch.isARM() and !target.result.cpu.arch.isX86()) {
+            std.debug.print("@todo: is this correctly ARM64?\n", .{});
+            lib.addObjectFile(b.path("extlibs/libs-msvc-universal/ARM64/vorbis.lib"));
+            lib.addObjectFile(b.path("extlibs/libs-msvc-universal/ARM64/vorbisenc.lib"));
+            lib.addObjectFile(b.path("extlibs/libs-msvc-universal/ARM64/vorbisfile.lib"));
+        } else if (target.result.cpu.arch.isX86()) {
+            lib.addObjectFile(b.path("extlibs/libs-msvc-universal/x86/vorbis.lib"));
+            lib.addObjectFile(b.path("extlibs/libs-msvc-universal/x86/vorbisenc.lib"));
+            lib.addObjectFile(b.path("extlibs/libs-msvc-universal/x86/vorbisfile.lib"));
+        } else {
+            std.debug.print("@todo: is this correctly x64?", .{});
+            lib.addObjectFile(b.path("extlibs/libs-msvc-universal/x64/vorbis.lib"));
+            lib.addObjectFile(b.path("extlibs/libs-msvc-universal/x64/vorbisenc.lib"));
+            lib.addObjectFile(b.path("extlibs/libs-msvc-universal/x64/vorbisfile.lib"));
+        }
+    }
+    return lib;
+}
 
-    b.installArtifact(vorbis);
-
-    // flac
-    const flac = b.addStaticLibrary(.{
+fn build_flac(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
+    const lib = b.addStaticLibrary(.{
         .name = "flac",
         .target = target,
         .optimize = optimize,
     });
 
-    flac.addIncludePath(b.path("extlibs/headers"));
+    lib.addIncludePath(b.path("extlibs/headers/FLAC"));
+    lib.addLibraryPath(b.path(""));
 
-    flac.addObjectFile(b.path("extlibs/libs-msvc-universal/x64/flac.lib"));
+    if (target.result.isAndroid()) {
+        std.debug.print("@todo: include android libs based on ARCH\n", .{});
+    } else if (target.result.os.tag == std.Target.Os.Tag.ios) {
+        lib.addObjectFile(b.path("extlibs/libs-ios/libflac.a"));
+    } else if (target.result.os.tag == std.Target.Os.Tag.macos) {
+        std.debug.print("@todo include macos libs from .framework\n", .{});
+    } else if (target.result.isMinGW()) {
+        std.debug.print("@todo: how do i check for URT?\n", .{});
+        if (target.result.cpu.arch.isX86()) {
+            lib.addObjectFile(b.path("extlibs/libs-mingw/x86/libFLAC.a"));
+        } else {
+            std.debug.print("@todo: is this correctly x64?\n", .{});
+            lib.addObjectFile(b.path("extlibs/libs-mingw/x64/libFLAC.a"));
+        }
+    } else if (target.result.os.tag == std.Target.Os.Tag.windows) {
+        if (target.result.cpu.arch.isARM() and !target.result.cpu.arch.isX86()) {
+            std.debug.print("@todo: is this correctly ARM64?\n", .{});
+            lib.addObjectFile(b.path("extlibs/libs-msvc-universal/ARM64/flac.lib"));
+        } else if (target.result.cpu.arch.isX86()) {
+            lib.addObjectFile(b.path("extlibs/libs-msvc-universal/x86/flac.lib"));
+        } else {
+            std.debug.print("@todo: is this correctly x64?\n", .{});
+            lib.addObjectFile(b.path("extlibs/libs-msvc-universal/x64/flac.lib"));
+        }
+    }
 
-    b.installArtifact(flac);
+    return lib;
+}
 
-    // sfml-audio
-    const sfml_audio = b.addStaticLibrary(.{
+fn build_sfml_audio(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, vorbis: *std.Build.Step.Compile, flac: *std.Build.Step.Compile, sfml_system: *std.Build.Step.Compile) *std.Build.Step.Compile {
+    const lib = b.addStaticLibrary(.{
         .name = "sfml-audio",
         .target = target,
         .optimize = optimize,
     });
 
-    const sfml_audio_source_files = [_][]const u8{
+    lib.addIncludePath(b.path("src"));
+    lib.addIncludePath(b.path("include"));
+
+    // all source files
+    const source_files = [_][]const u8{
         "AudioResource.cpp",
         "AudioDevice.cpp",
         "Listener.cpp",
@@ -106,7 +266,13 @@ pub fn build(b: *std.Build) void {
         "SoundSource.cpp",
         "SoundStream.cpp",
     };
-    const sfml_audio_codedc_source_files = [_][]const u8{
+    lib.addCSourceFiles(.{
+        .root = b.path("src/SFML/Audio"),
+        .files = &source_files,
+        .flags = &[_][]const u8{"-std=c++17"},
+    });
+
+    const codec_files = [_][]const u8{
         "SoundFileFactory.cpp",
         "SoundFileReaderFlac.cpp",
         "SoundFileReaderMp3.cpp",
@@ -116,197 +282,71 @@ pub fn build(b: *std.Build) void {
         "SoundFileWriterOgg.cpp",
         "SoundFileWriterWav.cpp",
     };
-    sfml_audio.addCSourceFiles(.{ .root = b.path("src/SFML/Audio"), .files = &sfml_audio_source_files });
-    sfml_audio.addCSourceFiles(.{ .root = b.path("src/SFML/Audio"), .files = &sfml_audio_codedc_source_files });
 
-    sfml_audio.addIncludePath(b.path("include"));
-    sfml_audio.addIncludePath(b.path("src"));
-    sfml_audio.addIncludePath(b.path("extlibs/headers"));
-    sfml_audio.addIncludePath(b.path("extlibs/headers/miniaudio"));
-    sfml_audio.addIncludePath(b.path("extlibs/headers/minimp3"));
+    // Ensure certain files are compiled as Objective-C++
+    // See: https://miniaud.io/docs/manual/index.html#Building
+    if (target.result.os.tag == std.Target.Os.Tag.ios) {
+        std.debug.print("OBJCXX and Miniaudio.cpp not set", .{});
+    }
 
-    sfml_audio.linkLibrary(vorbis);
-    sfml_audio.linkLibrary(flac);
-    sfml_audio.linkLibCpp();
+    // let CMake know about our additional audio libraries paths (on Android and macOS)
+    if (target.result.os.tag == std.Target.Os.Tag.macos) {
+        std.debug.print("NEED TO ADD extlibs/libs-macos/Frameworks to LIBRARY PATH", .{});
+    } else if (target.result.isAndroid()) {
+        std.debug.print("NEED TO ADD extlibs/android to INCLUDE PATH", .{});
+    }
 
-    b.installArtifact(sfml_audio);
-
-    // sfml-window
-    const sfml_window = b.addStaticLibrary(.{
-        .name = "sfml-window",
-        .target = target,
-        .optimize = optimize,
+    lib.addCSourceFiles(.{
+        .root = b.path("src/SFML/Audio"),
+        .files = &codec_files,
+        .flags = &[_][]const u8{"-std=c++17"},
     });
 
-    const sfml_window_source_files = [_][]const u8{
-        "Clipboard.cpp",
-        "Context.cpp",
-        "Cursor.cpp",
-        "GlContext.cpp",
-        "GlResource.cpp",
-        "Joystick.cpp",
-        "JoystickManager.cpp",
-        "Keyboard.cpp",
-        "Mouse.cpp",
-        "Touch.cpp",
-        "Sensor.cpp",
-        "SensorManager.cpp",
-        "VideoMode.cpp",
-        "Vulkan.cpp",
-        "Window.cpp",
-        "WindowBase.cpp",
-        "WindowImpl.cpp",
-    };
-    const sfml_window_source_files_win32 = [_][]const u8{
-        "CursorImpl.cpp",
-        "ClipboardImpl.cpp",
-        "InputImpl.cpp",
-        "JoystickImpl.cpp",
-        "SensorImpl.cpp",
-        "VideoModeImpl.cpp",
-        "VulkanImplWin32.cpp",
-        "WindowImplWin32.cpp",
+    // avoids warnings in vorbisfile.h
+    lib.defineCMacro("OV_EXCLUDE_STATIC_CALLBACKS", null);
+    lib.defineCMacro("FLAC__NO_DLL", null);
 
-        // no opengl es support yet
-        "WglContext.cpp",
-    };
-    sfml_window.addCSourceFiles(.{ .root = b.path("src/SFML/Window"), .files = &sfml_window_source_files });
-    sfml_window.addCSourceFiles(.{ .root = b.path("src/SFML/Window/Win32"), .files = &sfml_window_source_files_win32 });
+    // disable miniaudio features we do not use
+    lib.defineCMacro("MA_NO_MP3", null);
+    lib.defineCMacro("MA_NO_FLAC", null);
+    lib.defineCMacro("MA_NO_ENCODING", null);
+    lib.defineCMacro("MA_NO_RESOURCE_MANAGER", null);
+    lib.defineCMacro("MA_NO_GENERATION", null);
 
-    sfml_window.addIncludePath(b.path("include"));
-    sfml_window.addIncludePath(b.path("src"));
-    sfml_window.addIncludePath(b.path("extlibs/headers/glad/include"));
-    sfml_window.addIncludePath(b.path("extlibs/headers/vulkan"));
+    // use standard fixed-width integer types
+    lib.defineCMacro("MA_USE_STDINT", null);
 
-    sfml_window.linkLibrary(sfml_system);
-    sfml_window.linkSystemLibrary("winmm");
-    sfml_window.linkSystemLibrary("gdi32");
-    sfml_window.linkSystemLibrary("opengl32");
-    sfml_window.linkLibCpp();
+    // miniaudio sources
+    lib.addIncludePath(b.path("extlibs/headers/miniaudio"));
 
-    b.installArtifact(sfml_window);
+    // minimp3 sources
+    lib.addIncludePath(b.path("extlibs/headers/minimp3"));
 
-    // freetype
-    const freetype = b.addStaticLibrary(.{
-        .name = "freetype",
-        .target = target,
-        .optimize = optimize,
-    });
+    if (target.result.isAndroid()) {
+        lib.linkSystemLibrary("android");
+        lib.linkSystemLibrary("OpenSLES");
+    }
 
-    freetype.addIncludePath(b.path("extlibs/headers/freetype2"));
+    if (target.result.os.tag == std.Target.Os.Tag.linux) {
+        lib.linkSystemLibrary("dl");
+    }
 
-    freetype.addObjectFile(b.path("extlibs/libs-msvc-universal/x64/freetype.lib"));
+    lib.linkLibrary(sfml_system);
 
-    b.installArtifact(freetype);
+    lib.addIncludePath(b.path("extlibs/headers"));
+    lib.linkLibrary(vorbis);
+    lib.linkLibrary(flac);
+    lib.linkLibCpp();
 
-    // sfml-graphics
-    const sfml_graphics = b.addStaticLibrary(.{
+    return lib;
+}
+
+fn build_sfml_graphics(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, vorbis: *std.Build.Step.Compile, flac: *std.Build.Step.Compile, sfml_system: *std.Build.Step.Compile) *std.Build.Step.Compile {
+    const lib = b.addStaticLibrary(.{
         .name = "sfml-graphics",
         .target = target,
         .optimize = optimize,
     });
 
-    const sfml_graphics_source_files = [_][]const u8{
-        "BlendMode.cpp",
-        "Font.cpp",
-        "Glsl.cpp",
-        "GLCheck.cpp",
-        "GLExtensions.cpp",
-        "Image.cpp",
-        "RenderStates.cpp",
-        "RenderTexture.cpp",
-        "RenderTarget.cpp",
-        "RenderWindow.cpp",
-        "Shader.cpp",
-        "StencilMode.cpp",
-        "Texture.cpp",
-        "TextureSaver.cpp",
-        "Transform.cpp",
-        "Transformable.cpp",
-        "View.cpp",
-    };
-    const sfml_graphics_drawables_source_files = [_][]const u8{
-        "Shape.cpp",
-        "CircleShape.cpp",
-        "RectangleShape.cpp",
-        "ConvexShape.cpp",
-        "Sprite.cpp",
-        "Text.cpp",
-        "VertexArray.cpp",
-        "VertexBuffer.cpp",
-    };
-    const sfml_graphics_render_texture_source_files = [_][]const u8{
-        "RenderTextureImplFBO.cpp",
-        "RenderTextureImplDefault.cpp",
-    };
-    sfml_graphics.addCSourceFiles(.{
-        .root = b.path("src/SFML/Graphics"),
-        .files = &sfml_graphics_source_files,
-    });
-    sfml_graphics.addCSourceFiles(.{
-        .root = b.path("src/SFML/Graphics"),
-        .files = &sfml_graphics_drawables_source_files,
-    });
-    sfml_graphics.addCSourceFiles(.{
-        .root = b.path("src/SFML/Graphics"),
-        .files = &sfml_graphics_render_texture_source_files,
-    });
-
-    sfml_graphics.addIncludePath(b.path("include"));
-    sfml_graphics.addIncludePath(b.path("src"));
-    sfml_graphics.addIncludePath(b.path("extlibs/headers/stb_image"));
-    sfml_graphics.addIncludePath(b.path("extlibs/headers/glad/include"));
-    sfml_graphics.addIncludePath(b.path("extlibs/headers/freetype2"));
-
-    sfml_graphics.linkLibrary(freetype);
-    sfml_graphics.linkLibrary(sfml_window);
-    sfml_graphics.linkLibCpp();
-
-    sfml_graphics.defineCMacro("STBI_FAILURE_USERMSG", null);
-
-    b.installArtifact(
-        sfml_graphics,
-    );
-
-    // sfml-network
-    const sfml_network = b.addStaticLibrary(.{
-        .name = "sfml-network",
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const sfml_network_source_files = [_][]const u8{
-        "Ftp.cpp",
-        "Http.cpp",
-        "IpAddress.cpp",
-        "Packet.cpp",
-        "Socket.cpp",
-        "SocketSelector.cpp",
-        "TcpListener.cpp",
-        "TcpSocket.cpp",
-        "UdpSocket.cpp",
-    };
-    sfml_network.addCSourceFiles(.{
-        .root = b.path("src/SFML/Network"),
-        .files = &sfml_network_source_files,
-    });
-    sfml_network.addIncludePath(b.path("include"));
-    sfml_network.addIncludePath(b.path("src"));
-
-    switch (target.result.os.tag) {
-        std.Target.Os.Tag.windows => {
-            sfml_network.addCSourceFile(.{
-                .file = b.path("src/SFML/Network/Win32/SocketImpl.cpp"),
-            });
-            sfml_network.linkSystemLibrary("ws2_32");
-        },
-        else => {
-            sfml_network.addCSourceFile(.{
-                .file = b.path("src/SFML/Network/Unix/SocketImpl.cpp"),
-            });
-        },
-    }
-
-    sfml_network.linkLibrary(sfml_system);
-    b.installArtifact(sfml_network);
+    return lib;
 }
